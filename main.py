@@ -15,7 +15,7 @@ import altair as alt
 
 # --- CONFIG ---
 OLLAMA_API = "http://localhost:11434/api/generate"
-MODEL_NAME = "llama3"
+MODEL_NAME = "llama3.1"
 SESSIONS_DIR = "sessions"
 
 # --- ENSURE SESSIONS DIR ---
@@ -257,9 +257,13 @@ if session_to_load:
     
     with col1:
         st.write("**Speed (km/h)**")
-        speed_chart = alt.Chart(df.reset_index()).mark_line(strokeWidth=2).encode(
+        # Format speed values for better readability - round to nearest integer
+        df_chart = df.copy()
+        df_chart['speed_rounded'] = df_chart['speed'].round(0)
+        speed_chart = alt.Chart(df_chart.reset_index()).mark_line(strokeWidth=2).encode(
             x=alt.X('index:Q', title='Time (samples)'),
-            y=alt.Y('speed:Q', title='Speed (km/h)'),
+            y=alt.Y('speed_rounded:Q', title='Speed (km/h)', 
+                    axis=alt.Axis(format='.0f')),
             color=alt.value('#1f77b4')
         ).properties(width=350, height=300)
         st.altair_chart(speed_chart, use_container_width=True)
@@ -293,8 +297,8 @@ if session_to_load:
         st.metric("🗺️ Track", f"{summary['track']} ({summary['layout']})")
         st.metric("⏱️ Session Length", f"{summary['session_length']:.1f} seconds")
     with col2:
-        st.metric("📊 Average Speed", f"{summary['avg_speed']:.1f} km/h")
-        st.metric("⚡ Max Speed", f"{summary['max_speed']:.1f} km/h")
+        st.metric("📊 Average Speed", f"{summary['avg_speed']:.0f} km/h")
+        st.metric("⚡ Max Speed", f"{summary['max_speed']:.0f} km/h")
         st.metric("🏁 Laps Completed", summary['lap_count'])
     with col3:
         st.metric("🚗 Average Throttle", f"{summary['avg_throttle']:.1%}")
