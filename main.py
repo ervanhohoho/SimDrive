@@ -21,9 +21,9 @@ SESSIONS_DIR = "sessions"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 # --- SHARED MEMORY CONFIG (Assetto Corsa) ---
-AC_SHARED_MEMORY_NAME = "Local\\ACPMemoryMapFileName"
-AC_GRAPHICS_MEMORY_NAME = "Local\\ACPMemoryMapFileGraphics"
-AC_STATIC_MEMORY_NAME = "Local\\ACPMemoryMapFileStatic"
+AC_SHARED_MEMORY_NAME = "Local\\acpmf_physics"
+AC_GRAPHICS_MEMORY_NAME = "Local\\acpmf_graphics"
+AC_STATIC_MEMORY_NAME = "Local\\acpmf_static"
 
 st.set_page_config(page_title="SimDrive Coach Live", layout="wide")
 st.title("🏎️ SimDrive Coach - Live Session Capture")
@@ -83,15 +83,17 @@ def read_physics_data():
 # --- INITIALIZE SESSION STATE ---
 if 'capturing' not in st.session_state:
     st.session_state.capturing = False
+if 'capture_event' not in st.session_state:
+    st.session_state.capture_event = threading.Event()
 if 'data_buffer' not in st.session_state:
     st.session_state.data_buffer = []
 if 'last_session_file' not in st.session_state:
     st.session_state.last_session_file = None
 
 # --- CAPTURE THREAD ---
-def capture_session():
+def capture_session(capture_event, data_buffer):
     start_time = time.time()
-    while st.session_state.capturing:
+    while capture_event.is_set():
         physics = read_physics_data()
         graphics = read_graphics_info()
         if physics:
@@ -103,7 +105,7 @@ def capture_session():
                 'steering': physics['steering'],
                 'laps': graphics['completed_laps']
             }
-            st.session_state.data_buffer.append(row)
+            data_buffer.append(row)
         time.sleep(0.1)
 
 # --- UI CONTROLS ---
@@ -115,11 +117,13 @@ with col1:
     if st.button("▶️ Start Session Capture", disabled=st.session_state.capturing):
         st.session_state.data_buffer.clear()
         st.session_state.capturing = True
-        threading.Thread(target=capture_session, daemon=True).start()
+        st.session_state.capture_event.set()
+        threading.Thread(target=capture_session, args=(st.session_state.capture_event, st.session_state.data_buffer), daemon=True).start()
         st.success("Capturing telemetry...")
 with col2:
     if st.button("⏹️ Stop Capture", disabled=not st.session_state.capturing):
         st.session_state.capturing = False
+        st.session_state.capture_event.clear()
         # --- AUTO SAVE ---
         if st.session_state.data_buffer:
             timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
