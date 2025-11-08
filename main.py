@@ -11,6 +11,7 @@ import mmap
 import threading
 import os
 from datetime import datetime
+import altair as alt
 
 # --- CONFIG ---
 OLLAMA_API = "http://localhost:11434/api/generate"
@@ -37,14 +38,43 @@ def read_static_info():
         data = file.read(4096)
         file.close()
 
-        car_name = data[0:100].split(b'\x00', 1)[0].decode('utf-8')
-        track_name = data[100:200].split(b'\x00', 1)[0].decode('utf-8')
-        track_config = data[200:300].split(b'\x00', 1)[0].decode('utf-8')
+        # Assetto Corsa static memory structure may have version at offset 0
+        # Try to find null-terminated strings starting from different offsets
+        # Common structure: version (int) at 0, car name at 4, track at 104, config at 204
+        # Or: car name at 0, track at 100, config at 200
+        
+        # Try reading from offset 0 first
+        car_name_bytes = data[0:100]
+        # If first 4 bytes look like an integer (version), skip them
+        if len(car_name_bytes) >= 4:
+            version_check = struct.unpack_from('i', car_name_bytes, 0)[0]
+            # If it's a small integer (likely version), start from offset 4
+            if 0 < version_check < 100:
+                car_name_bytes = data[4:104]
+                track_name_bytes = data[104:204]
+                track_config_bytes = data[204:304]
+            else:
+                car_name_bytes = data[0:100]
+                track_name_bytes = data[100:200]
+                track_config_bytes = data[200:300]
+        else:
+            track_name_bytes = data[100:200]
+            track_config_bytes = data[200:300]
+
+        # Extract null-terminated strings
+        car_name = car_name_bytes.split(b'\x00', 1)[0].decode('utf-8', errors='ignore').strip()
+        track_name = track_name_bytes.split(b'\x00', 1)[0].decode('utf-8', errors='ignore').strip()
+        track_config = track_config_bytes.split(b'\x00', 1)[0].decode('utf-8', errors='ignore').strip()
+
+        # Clean up empty strings and invalid characters
+        car_name = car_name if car_name and len(car_name) > 0 and not car_name.isdigit() else "Unknown"
+        track_name = track_name if track_name and len(track_name) > 0 else "Unknown"
+        track_config = track_config if track_config and len(track_config) > 0 else "Unknown"
 
         return {
-            "car_name": car_name or "Unknown",
-            "track_name": track_name or "Unknown",
-            "track_config": track_config or "Unknown",
+            "car_name": car_name,
+            "track_name": track_name,
+            "track_config": track_config,
         }
     except Exception as e:
         return {"car_name": "Unknown", "track_name": "Unknown", "track_config": "Unknown", "error": str(e)}
@@ -137,7 +167,28 @@ with col2:
 if st.session_state.last_session_file and os.path.exists(st.session_state.last_session_file):
     df = pd.read_csv(st.session_state.last_session_file)
     st.subheader("📊 Last Captured Session Data")
-    st.line_chart(df[['speed','throttle','brake']])
+    
+    # Create separate charts for speed and throttle/brake
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**Speed (km/h)**")
+        speed_chart = alt.Chart(df.reset_index()).mark_line(strokeWidth=2).encode(
+            x=alt.X('index:Q', title='Time (samples)'),
+            y=alt.Y('speed:Q', title='Speed (km/h)'),
+            color=alt.value('#1f77b4')
+        ).properties(width=350, height=300)
+        st.altair_chart(speed_chart, use_container_width=True)
+    
+    with col2:
+        st.write("**Throttle & Brake**")
+        controls_data = df[['throttle','brake']].copy().reset_index().melt(id_vars='index', var_name='metric', value_name='value')
+        controls_chart = alt.Chart(controls_data).mark_line(strokeWidth=2).encode(
+            x=alt.X('index:Q', title='Time (samples)'),
+            y=alt.Y('value:Q', scale=alt.Scale(domain=[0, 1]), title='Value'),
+            color='metric:N'
+        ).properties(width=350, height=300)
+        st.altair_chart(controls_chart, use_container_width=True)
 
     summary = {
         "avg_speed": float(df['speed'].mean()),
@@ -151,8 +202,19 @@ if st.session_state.last_session_file and os.path.exists(st.session_state.last_s
         "layout": static_info['track_config']
     }
 
-    st.write("### 🧩 Summary:")
-    st.json(summary)
+    st.write("### 🧩 Session Summary:")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("🏁 Car", summary['car'])
+        st.metric("🗺️ Track", f"{summary['track']} ({summary['layout']})")
+        st.metric("⏱️ Session Length", f"{summary['session_length']:.1f} seconds")
+    with col2:
+        st.metric("📊 Average Speed", f"{summary['avg_speed']:.1f} km/h")
+        st.metric("⚡ Max Speed", f"{summary['max_speed']:.1f} km/h")
+        st.metric("🏁 Laps Completed", summary['lap_count'])
+    with col3:
+        st.metric("🚗 Average Throttle", f"{summary['avg_throttle']:.1%}")
+        st.metric("🛑 Average Brake", f"{summary['avg_brake']:.1%}")
 
     # --- SEND TO OLLAMA ---
     prompt = f"""
@@ -173,14 +235,28 @@ if st.session_state.last_session_file and os.path.exists(st.session_state.last_s
         try:
             response = requests.post(
                 OLLAMA_API,
-                json={"model": MODEL_NAME, "prompt": prompt},
+                json={"model": MODEL_NAME, "prompt": prompt, "stream": False},
                 timeout=90
             )
+            response.raise_for_status()
             data = response.json()
-            feedback = data.get("response", "No feedback received.")
+            
+            # Ollama API returns "response" field for non-streaming, or we need to handle streaming
+            feedback = data.get("response", "")
+            
+            # If response is empty, try to get it from the data structure
+            if not feedback and isinstance(data, dict):
+                # Sometimes the response might be in a different format
+                feedback = str(data).strip()
+            
+            if not feedback:
+                feedback = "No feedback received from Ollama. Please check if Ollama is running and the model is available."
 
             st.subheader("💬 AI Coaching Feedback")
-            st.write(feedback)
+            st.markdown(feedback)
 
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             st.error(f"❌ Error contacting Ollama: {e}")
+            st.info("Make sure Ollama is running on localhost:11434 and the model is available.")
+        except Exception as e:
+            st.error(f"❌ Unexpected error: {e}")
