@@ -12,7 +12,7 @@ import os
 
 # --- CONFIG ---
 OLLAMA_API = "http://localhost:11434/api/generate"
-MODEL_NAME = "llama3"  # Change to your preferred Ollama model
+MODEL_NAME = "llama3.1"  # Change to your preferred Ollama model
 
 # --- SHARED MEMORY CONFIG (Assetto Corsa) ---
 AC_SHARED_MEMORY_NAME = "Local\\ACPMemoryMapFileName"
