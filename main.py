@@ -1,4 +1,4 @@
-# SimDrive Coach Prototype (Session Capture + Car/Track Detection)
+# SimDrive Coach Prototype (Session Capture + Auto Save/Load + Ollama Feedback)
 # Offline Assetto Corsa driving coach using Ollama, Streamlit, and live session telemetry capture
 
 import streamlit as st
@@ -9,10 +9,16 @@ import time
 import struct
 import mmap
 import threading
+import os
+from datetime import datetime
 
 # --- CONFIG ---
 OLLAMA_API = "http://localhost:11434/api/generate"
-MODEL_NAME = "llama3.1"
+MODEL_NAME = "llama3"
+SESSIONS_DIR = "sessions"
+
+# --- ENSURE SESSIONS DIR ---
+os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 # --- SHARED MEMORY CONFIG (Assetto Corsa) ---
 AC_SHARED_MEMORY_NAME = "Local\\ACPMemoryMapFileName"
@@ -50,9 +56,8 @@ def read_graphics_info():
         data = file.read(2048)
         file.close()
 
-        # Parse basic session state (status and completed laps)
-        status = struct.unpack_from('i', data, 0)[0]  # 1=menu, 2=replay, 3=live
-        session = struct.unpack_from('i', data, 4)[0]  # 0=practice,1=qualify,2=race
+        status = struct.unpack_from('i', data, 0)[0]
+        session = struct.unpack_from('i', data, 4)[0]
         completed_laps = struct.unpack_from('i', data, 8)[0]
 
         return {"status": status, "session": session, "completed_laps": completed_laps}
@@ -66,28 +71,27 @@ def read_physics_data():
         data = file.read(2048)
         file.close()
 
-        speed = struct.unpack_from('f', data, 0)[0] * 3.6  # m/s to km/h
+        speed = struct.unpack_from('f', data, 0)[0] * 3.6
         throttle = struct.unpack_from('f', data, 4)[0]
         brake = struct.unpack_from('f', data, 8)[0]
         steering = struct.unpack_from('f', data, 12)[0]
 
-        return {
-            'speed': speed,
-            'throttle': throttle,
-            'brake': brake,
-            'steering': steering
-        }
+        return {'speed': speed, 'throttle': throttle, 'brake': brake, 'steering': steering}
     except Exception:
         return None
 
-# --- CAPTURE THREAD ---
-capturing = False
-data_buffer = []
+# --- INITIALIZE SESSION STATE ---
+if 'capturing' not in st.session_state:
+    st.session_state.capturing = False
+if 'data_buffer' not in st.session_state:
+    st.session_state.data_buffer = []
+if 'last_session_file' not in st.session_state:
+    st.session_state.last_session_file = None
 
+# --- CAPTURE THREAD ---
 def capture_session():
-    global capturing, data_buffer
     start_time = time.time()
-    while capturing:
+    while st.session_state.capturing:
         physics = read_physics_data()
         graphics = read_graphics_info()
         if physics:
@@ -99,7 +103,7 @@ def capture_session():
                 'steering': physics['steering'],
                 'laps': graphics['completed_laps']
             }
-            data_buffer.append(row)
+            st.session_state.data_buffer.append(row)
         time.sleep(0.1)
 
 # --- UI CONTROLS ---
@@ -108,22 +112,28 @@ st.markdown(f"### 🏁 Car: **{static_info['car_name']}** | 🗺️ Track: **{st
 
 col1, col2 = st.columns(2)
 with col1:
-    if st.button("▶️ Start Session Capture"):
-        data_buffer.clear()
-        capturing = True
-        thread = threading.Thread(target=capture_session)
-        thread.start()
+    if st.button("▶️ Start Session Capture", disabled=st.session_state.capturing):
+        st.session_state.data_buffer.clear()
+        st.session_state.capturing = True
+        threading.Thread(target=capture_session, daemon=True).start()
         st.success("Capturing telemetry...")
 with col2:
-    if st.button("⏹️ Stop Capture"):
-        capturing = False
-        st.success("Capture stopped.")
+    if st.button("⏹️ Stop Capture", disabled=not st.session_state.capturing):
+        st.session_state.capturing = False
+        # --- AUTO SAVE ---
+        if st.session_state.data_buffer:
+            timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            filename = f"{static_info['car_name'].replace(' ','_')}_{static_info['track_name'].replace(' ','_')}_{timestamp}.csv"
+            filepath = os.path.join(SESSIONS_DIR, filename)
+            pd.DataFrame(st.session_state.data_buffer).to_csv(filepath, index=False)
+            st.session_state.last_session_file = filepath
+            st.success(f"Session saved: {filepath}")
 
-# --- DISPLAY & ANALYSIS ---
-if not capturing and data_buffer:
-    df = pd.DataFrame(data_buffer)
-    st.subheader("📊 Captured Session Data")
-    st.line_chart(df[['speed', 'throttle', 'brake']])
+# --- AUTO LOAD LAST SESSION ---
+if st.session_state.last_session_file and os.path.exists(st.session_state.last_session_file):
+    df = pd.read_csv(st.session_state.last_session_file)
+    st.subheader("📊 Last Captured Session Data")
+    st.line_chart(df[['speed','throttle','brake']])
 
     summary = {
         "avg_speed": float(df['speed'].mean()),
@@ -140,7 +150,7 @@ if not capturing and data_buffer:
     st.write("### 🧩 Summary:")
     st.json(summary)
 
-    # --- Send to Ollama ---
+    # --- SEND TO OLLAMA ---
     prompt = f"""
     You are a professional racing coach analyzing Assetto Corsa telemetry.
     Car: {summary['car']}
