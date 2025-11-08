@@ -110,6 +110,40 @@ def read_physics_data():
     except Exception:
         return None
 
+# --- HELPER FUNCTIONS ---
+def get_session_files():
+    """Get all session CSV files sorted by modification time (newest first)"""
+    if not os.path.exists(SESSIONS_DIR):
+        return []
+    files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith('.csv')]
+    files.sort(key=lambda x: os.path.getmtime(os.path.join(SESSIONS_DIR, x)), reverse=True)
+    return files
+
+def get_analysis_file(csv_file):
+    """Get the corresponding analysis JSON file for a CSV session file"""
+    base_name = os.path.splitext(csv_file)[0]
+    return os.path.join(SESSIONS_DIR, f"{base_name}_analysis.json")
+
+def save_analysis(filepath, summary, feedback):
+    """Save session analysis to JSON file"""
+    analysis = {
+        "timestamp": datetime.now().isoformat(),
+        "summary": summary,
+        "feedback": feedback
+    }
+    analysis_file = get_analysis_file(filepath)
+    with open(analysis_file, 'w', encoding='utf-8') as f:
+        json.dump(analysis, f, indent=2, ensure_ascii=False)
+    return analysis_file
+
+def load_analysis(filepath):
+    """Load session analysis from JSON file"""
+    analysis_file = get_analysis_file(filepath)
+    if os.path.exists(analysis_file):
+        with open(analysis_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return None
+
 # --- INITIALIZE SESSION STATE ---
 if 'capturing' not in st.session_state:
     st.session_state.capturing = False
@@ -119,6 +153,8 @@ if 'data_buffer' not in st.session_state:
     st.session_state.data_buffer = []
 if 'last_session_file' not in st.session_state:
     st.session_state.last_session_file = None
+if 'selected_session' not in st.session_state:
+    st.session_state.selected_session = None
 
 # --- CAPTURE THREAD ---
 def capture_session(capture_event, data_buffer):
@@ -137,6 +173,41 @@ def capture_session(capture_event, data_buffer):
             }
             data_buffer.append(row)
         time.sleep(0.1)
+
+# --- SIDEBAR: SESSION HISTORY ---
+with st.sidebar:
+    st.header("📚 Session History")
+    session_files = get_session_files()
+    
+    if session_files:
+        # Create a list of session names for selection
+        session_options = ["Select a session..."] + session_files
+        
+        # Get the index of the currently selected session
+        current_index = 0
+        if st.session_state.selected_session:
+            try:
+                current_index = session_files.index(st.session_state.selected_session) + 1
+            except ValueError:
+                current_index = 0
+        
+        selected = st.selectbox(
+            "Previous Sessions",
+            options=session_options,
+            index=current_index,
+            key="session_selector"
+        )
+        
+        if selected and selected != "Select a session...":
+            st.session_state.selected_session = selected
+        elif selected == "Select a session...":
+            st.session_state.selected_session = None
+        
+        st.markdown("---")
+        st.write(f"**Total Sessions:** {len(session_files)}")
+    else:
+        st.info("No previous sessions found.")
+        st.session_state.selected_session = None
 
 # --- UI CONTROLS ---
 static_info = read_static_info()
@@ -161,12 +232,25 @@ with col2:
             filepath = os.path.join(SESSIONS_DIR, filename)
             pd.DataFrame(st.session_state.data_buffer).to_csv(filepath, index=False)
             st.session_state.last_session_file = filepath
-            st.success(f"Session saved: {filepath}")
+            st.session_state.selected_session = filename
+            st.success(f"Session saved: {filename}")
 
-# --- AUTO LOAD LAST SESSION ---
-if st.session_state.last_session_file and os.path.exists(st.session_state.last_session_file):
-    df = pd.read_csv(st.session_state.last_session_file)
-    st.subheader("📊 Last Captured Session Data")
+# --- LOAD SELECTED OR LAST SESSION ---
+session_to_load = None
+
+# Determine which session to load
+if st.session_state.selected_session:
+    session_path = os.path.join(SESSIONS_DIR, st.session_state.selected_session)
+    if os.path.exists(session_path):
+        session_to_load = session_path
+elif st.session_state.last_session_file and os.path.exists(st.session_state.last_session_file):
+    session_to_load = st.session_state.last_session_file
+
+# --- DISPLAY SESSION DATA ---
+if session_to_load:
+    df = pd.read_csv(session_to_load)
+    session_name = os.path.basename(session_to_load)
+    st.subheader(f"📊 Session Data: {session_name}")
     
     # Create separate charts for speed and throttle/brake
     col1, col2 = st.columns(2)
@@ -216,47 +300,76 @@ if st.session_state.last_session_file and os.path.exists(st.session_state.last_s
         st.metric("🚗 Average Throttle", f"{summary['avg_throttle']:.1%}")
         st.metric("🛑 Average Brake", f"{summary['avg_brake']:.1%}")
 
-    # --- SEND TO OLLAMA ---
-    prompt = f"""
-    You are a professional racing coach analyzing Assetto Corsa telemetry.
-    Car: {summary['car']}
-    Track: {summary['track']} ({summary['layout']})
-    Session summary: {json.dumps(summary)}
-    Give detailed yet concise coaching advice on:
-    - braking technique
-    - throttle control
-    - cornering habits
-    - consistency across laps
-    - possible setup improvements for this car and track
-    End with a short motivational tip.
-    """
+    # --- AI COACHING FEEDBACK ---
+    existing_analysis = load_analysis(session_to_load)
+    
+    # Check if we should generate new analysis
+    generate_analysis = False
+    if not existing_analysis:
+        generate_analysis = True
+    else:
+        # Add button to regenerate analysis
+        if st.button("🔄 Regenerate AI Analysis"):
+            generate_analysis = True
+    
+    if generate_analysis:
+        # --- SEND TO OLLAMA ---
+        prompt = f"""
+        You are a professional racing coach analyzing Assetto Corsa telemetry.
+        Car: {summary['car']}
+        Track: {summary['track']} ({summary['layout']})
+        Session summary: {json.dumps(summary)}
+        Give detailed yet concise coaching advice on:
+        - braking technique
+        - throttle control
+        - cornering habits
+        - consistency across laps
+        - possible setup improvements for this car and track
+        End with a short motivational tip.
+        """
 
-    with st.spinner("Analyzing with Ollama model..."):
-        try:
-            response = requests.post(
-                OLLAMA_API,
-                json={"model": MODEL_NAME, "prompt": prompt, "stream": False},
-                timeout=90
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            # Ollama API returns "response" field for non-streaming, or we need to handle streaming
-            feedback = data.get("response", "")
-            
-            # If response is empty, try to get it from the data structure
-            if not feedback and isinstance(data, dict):
-                # Sometimes the response might be in a different format
-                feedback = str(data).strip()
-            
-            if not feedback:
-                feedback = "No feedback received from Ollama. Please check if Ollama is running and the model is available."
+        with st.spinner("Analyzing with Ollama model..."):
+            try:
+                response = requests.post(
+                    OLLAMA_API,
+                    json={"model": MODEL_NAME, "prompt": prompt, "stream": False},
+                    timeout=90
+                )
+                response.raise_for_status()
+                data = response.json()
+                
+                # Ollama API returns "response" field for non-streaming, or we need to handle streaming
+                feedback = data.get("response", "")
+                
+                # If response is empty, try to get it from the data structure
+                if not feedback and isinstance(data, dict):
+                    # Sometimes the response might be in a different format
+                    feedback = str(data).strip()
+                
+                if not feedback:
+                    feedback = "No feedback received from Ollama. Please check if Ollama is running and the model is available."
 
-            st.subheader("💬 AI Coaching Feedback")
-            st.markdown(feedback)
+                # Save analysis to JSON file
+                try:
+                    analysis_file = save_analysis(session_to_load, summary, feedback)
+                    existing_analysis = load_analysis(session_to_load)  # Reload after saving
+                    st.success(f"✅ Analysis saved to: {os.path.basename(analysis_file)}")
+                except Exception as e:
+                    st.warning(f"⚠️ Could not save analysis: {e}")
+                    # Still create analysis object for display even if save failed
+                    existing_analysis = {
+                        "feedback": feedback,
+                        "timestamp": datetime.now().isoformat()
+                    }
 
-        except requests.exceptions.RequestException as e:
-            st.error(f"❌ Error contacting Ollama: {e}")
-            st.info("Make sure Ollama is running on localhost:11434 and the model is available.")
-        except Exception as e:
-            st.error(f"❌ Unexpected error: {e}")
+            except requests.exceptions.RequestException as e:
+                st.error(f"❌ Error contacting Ollama: {e}")
+                st.info("Make sure Ollama is running on localhost:11434 and the model is available.")
+            except Exception as e:
+                st.error(f"❌ Unexpected error: {e}")
+    
+    # Display analysis (either existing or newly generated)
+    if existing_analysis:
+        st.subheader("💬 AI Coaching Feedback")
+        st.markdown(existing_analysis.get("feedback", "No feedback available."))
+        st.caption(f"Analysis saved on: {existing_analysis.get('timestamp', 'Unknown')}")
